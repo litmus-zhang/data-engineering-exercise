@@ -1,47 +1,121 @@
 version: '3.8'
-
 services:
-  db:
-    image: timescale/timescaledb:latest-pg16
-    environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: mydb
+  medusa-db:
+    image: postgres:14-alpine
+    container_name: medusa-db
+    hostname: medusa-db
     ports:
       - "5432:5432"
+    environment:
+      POSTGRES_USER: medusa
+      POSTGRES_PASSWORD: medusa_password
+      POSTGRES_DB: medusa_db
+    # Enable logical replication for Debezium
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_wal_senders=5", "-c", "max_replication_slots=5"]
     volumes:
-      - db_data:/var/lib/postgresql/data
-    networks:
-      - app-network
+      - medusa_data:/var/lib/postgresql/data
+      - ./init/medusa_init.sql:/docker-entrypoint-initdb.d/medusa_init.sql  # schema & seed data
 
-  apache_beam:
-    image: apache/beam_python3.11_sdk:latest
-    command: ["sleep", "infinity"] # Replace with your Beam job command
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.1
+    container_name: zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.1
+    container_name: kafka
+    hostname: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"   # Internal broker listener
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Advertise both internal and external listeners
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     volumes:
-      - ./beam:/app
-    working_dir: /app
-    networks:
-      - app-network
+      - kafka_data:/var/lib/kafka/data
+
+  debezium:
+    image: debezium/connect:1.9   # Debezium Kafka Connect image (includes Postgres connector)
+    container_name: debezium
+    hostname: debezium
+    depends_on:
+      kafka:
+        condition: service_healthy
+      medusa-db:
+        condition: service_healthy
+    ports:
+      - "8083:8083"   # Kafka Connect REST port (Debezium)
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: "1"
+      CONFIG_STORAGE_TOPIC: my_connect_configs
+      OFFSET_STORAGE_TOPIC: my_connect_offsets
+      STATUS_STORAGE_TOPIC: my_connect_statuses
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      PLUGIN_PATH: /kafka/connect     # (Optional) path for plugins if custom
+    # (Debezium will be configured via REST API to capture specific tables)
+
+  etl:
+    build:
+      context: ./etl   # directory containing Dockerfile for Prefect+Beam
+    container_name: etl
+    hostname: etl
+    depends_on:
+      medusa-db:
+        condition: service_healthy
+      timescale:
+        condition: service_healthy
+    # For simplicity, run the Prefect flow on container start (could also run an agent for scheduled runs)
+    command: ["python", "-u", "etl_pipeline.py"] 
+    environment:
+      PREFECT_LOGGING_LEVEL: INFO 
+      # (Add any needed env vars, e.g., DB connection URLs or API keys)
+    volumes:
+      - ./etl/etl_pipeline.py:/app/etl_pipeline.py  # mount the ETL script (alternatively baked into image)
+      - ./etl/requirements.txt:/app/requirements.txt
+      - prefect_storage:/root/.prefect  # if we want to persist Prefect data (optional)
+    # (In a real setup, you might run `prefect agent start` and rely on Prefect scheduler)
+
+  timescale:
+    image: timescale/timescaledb:latest-pg14   # TimescaleDB on PostgreSQL 14
+    container_name: timescale
+    hostname: timescale
+    ports:
+      - "5433:5432"   # expose TimescaleDB on host port 5433 (to avoid conflict with medusa-db)
+    environment:
+      POSTGRES_USER: ts_user
+      POSTGRES_PASSWORD: ts_password
+      POSTGRES_DB: ts_metrics_db
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
 
   metabase:
     image: metabase/metabase:latest
+    container_name: metabase
+    hostname: metabase
     ports:
       - "3000:3000"
     environment:
-      MB_DB_TYPE: postgres
-      MB_DB_DBNAME: mydb
-      MB_DB_PORT: 5432
-      MB_DB_USER: user
-      MB_DB_PASS: password
-      MB_DB_HOST: db
-    depends_on:
-      - db
-    networks:
-      - app-network
+      MB_DB_FILE: /metabase.db/metabase.db
+    volumes:
+      - metabase_data:/metabase.db
 
 volumes:
-  db_data:
-
-networks:
-  app-network:
-    driver: bridge
+  medusa_data:
+  kafka_data:
+  timescale_data:
+  metabase_data:
+  prefect_storage:

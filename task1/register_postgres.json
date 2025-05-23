@@ -1,0 +1,15 @@
+{
+  "name": "medusa-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "plugin.name": "pgoutput",
+    "database.hostname": "medusa-db",
+    "database.port": "5432",
+    "database.user": "medusa",
+    "database.password": "medusa_password",
+    "database.dbname": "medusa_db",
+    "database.server.name": "medusa", 
+    "table.include.list": "public.customers,public.products,public.orders,public.order_items",
+    "publication.autocreate.mode": "filtered" 
+  }
+}
